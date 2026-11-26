@@ -15,6 +15,12 @@
 package org.eclipse.lemminx.customservice.synapse.parser;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.maven.shared.invoker.DefaultInvocationRequest;
+import org.apache.maven.shared.invoker.DefaultInvoker;
+import org.apache.maven.shared.invoker.InvocationRequest;
+import org.apache.maven.shared.invoker.InvocationResult;
+import org.apache.maven.shared.invoker.Invoker;
+import org.apache.maven.shared.invoker.MavenInvocationException;
 import org.eclipse.lemminx.customservice.synapse.utils.Constant;
 import org.eclipse.lemminx.customservice.synapse.utils.Utils;
 import org.w3c.dom.Document;
@@ -26,9 +32,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -58,6 +67,10 @@ import static org.eclipse.lemminx.customservice.synapse.utils.Utils.getDependenc
 public class IntegrationProjectDownloadManager {
 
     private static final Logger LOGGER = Logger.getLogger(ConnectorDownloadManager.class.getName());
+    private static final String MVNW = "mvnw";
+    private static final String MVNW_CMD = "mvnw.cmd";
+    private static final String MAVEN_DEPENDENCY_COPY_GOAL = "dependency:copy";
+    private static final int MAVEN_TIMEOUT_SECONDS = 300;
 
     /**
      * Clears the Downloaded and Extracted directories for the given project and re-fetches
@@ -159,8 +172,8 @@ public class IntegrationProjectDownloadManager {
             try {
                 LOGGER.log(Level.INFO, "Processing dependency: " + dependency.getGroupId() + HYPHEN
                         + dependency.getArtifact() + HYPHEN + dependency.getVersion());
-                fetchDependencyRecursively(dependency, downloadDirectory, visitedDependencies, resolvedDependencies,
-                        isVersionedDeploymentEnabled, userHome);
+                fetchDependencyRecursively(projectPath, dependency, downloadDirectory, visitedDependencies,
+                        resolvedDependencies, isVersionedDeploymentEnabled, userHome);
             } catch (NoDescriptorException e) {
                 String failedDependency =
                         dependency.getGroupId() + HYPHEN + dependency.getArtifact() + HYPHEN + dependency.getVersion();
@@ -274,6 +287,7 @@ public class IntegrationProjectDownloadManager {
      * downloads and infinite loops.
      * </p>
      *
+     * @param projectPath          the file system path of the integration project, used for the Maven fallback
      * @param dependency           the dependency to fetch
      * @param downloadDirectory    the directory to store downloaded .car files
      * @param visitedDependencies  a set of dependency keys already visited to prevent duplicate processing and infinite loops
@@ -281,7 +295,7 @@ public class IntegrationProjectDownloadManager {
      * @param isVersionedDeploymentEnabled indicates if versioned deployment is enabled in the parent project
      * @throws Exception if fetching or parsing fails
      */
-    static void fetchDependencyRecursively(DependencyDetails dependency, File downloadDirectory,
+    static void fetchDependencyRecursively(String projectPath, DependencyDetails dependency, File downloadDirectory,
                                            Set<String> visitedDependencies, Set<String> resolvedDependencies,
                                            boolean isVersionedDeploymentEnabled, Path userHome)
             throws Exception {
@@ -304,7 +318,7 @@ public class IntegrationProjectDownloadManager {
             LOGGER.log(Level.INFO, "Dependency already in Downloaded directory: " + existingFile.getName());
             carFile = existingFile;
         } else {
-            carFile = fetchDependencyFile(dependency, downloadDirectory, userHome);
+            carFile = fetchDependencyFile(projectPath, dependency, downloadDirectory, userHome);
             if (!carFile.exists()) {
                 throw new Exception("Failed to fetch .car file for dependency: " + dependencyKey);
             }
@@ -323,7 +337,7 @@ public class IntegrationProjectDownloadManager {
 
         // Recursively fetch transitive dependencies
         for (DependencyDetails transitiveDependency : transitiveDependencies) {
-            fetchDependencyRecursively(transitiveDependency, downloadDirectory,
+            fetchDependencyRecursively(projectPath, transitiveDependency, downloadDirectory,
                     visitedDependencies, resolvedDependencies, isVersionedDeploymentEnabled, userHome);
         }
     }
@@ -354,14 +368,17 @@ public class IntegrationProjectDownloadManager {
      * <p>
      * If the dependency file already exists in the download directory, it is returned.
      * Otherwise, attempts to copy it from the local repository. If not found locally,
-     * the method is prepared to handle remote downloads
+     * falls back to resolving it with Maven against the project's pom.xml so that the
+     * repositories declared in the project (and the user's Maven settings) are honoured.
      * </p>
      *
+     * @param projectPath       the file system path of the integration project
      * @param dependency        the dependency details to fetch
      * @param downloadDirectory the directory to store or locate the downloaded .car file
      * @return the File object representing the dependency .car file
      */
-    private static File fetchDependencyFile(DependencyDetails dependency, File downloadDirectory, Path userHome) {
+    private static File fetchDependencyFile(String projectPath, DependencyDetails dependency, File downloadDirectory,
+                                            Path userHome) {
 
         File dependencyFile = new File(downloadDirectory,
                 dependency.getGroupId() + HYPHEN + dependency.getArtifact() + HYPHEN + dependency.getVersion() + DOT +
@@ -384,10 +401,110 @@ public class IntegrationProjectDownloadManager {
                             "Error occurred while downloading dependency " + failedDependency + ": " + e.getMessage());
                 }
             } else {
-                // TODO: Download the dependency from the remote repository if not found in the local repository
+                downloadDependencyWithMaven(projectPath, dependency, dependencyFile);
             }
         }
         return dependencyFile;
+    }
+
+    /**
+     * Resolves the given dependency with Maven ({@code dependency:copy}) using the project's pom.xml,
+     * so that repositories declared in the project, mirrors and credentials from the user's
+     * Maven settings are taken into account. The resolved file is written to {@code targetFile}.
+     * <p>
+     * Uses the system Maven when the project is configured with {@code useLocalMaven}, otherwise the
+     * project's Maven wrapper. Failures are logged; callers detect them by the absence of {@code targetFile}.
+     * </p>
+     *
+     * @param projectPath the file system path of the integration project
+     * @param dependency  the dependency details to resolve
+     * @param targetFile  the file the resolved artifact should be written to
+     */
+    private static void downloadDependencyWithMaven(String projectPath, DependencyDetails dependency,
+                                                    File targetFile) {
+
+        String dependencyId = dependency.getGroupId() + HYPHEN + dependency.getArtifact() + HYPHEN +
+                dependency.getVersion();
+        if (StringUtils.isBlank(projectPath)) {
+            return;
+        }
+        File pomFile = Path.of(projectPath, Constant.POM).toFile();
+        if (!pomFile.isFile()) {
+            LOGGER.log(Level.INFO, "Skipping Maven resolution of " + dependencyId + ": pom.xml not found");
+            return;
+        }
+
+        Invoker invoker = new DefaultInvoker();
+        if (Utils.useLocalMaven(projectPath)) {
+            String mavenHome = Utils.getMavenHome();
+            if (StringUtils.isBlank(mavenHome)) {
+                LOGGER.log(Level.WARNING, "Skipping Maven resolution of " + dependencyId + ": Maven home not found");
+                return;
+            }
+            invoker.setMavenHome(new File(mavenHome));
+        } else {
+            boolean isWindows = System.getProperty(Constant.OS_TYPE).toLowerCase().contains(Constant.WINDOWS_PREFIX);
+            File mvnwFile = Path.of(projectPath, isWindows ? MVNW_CMD : MVNW).toFile();
+            if (!mvnwFile.isFile()) {
+                LOGGER.log(Level.WARNING, "Skipping Maven resolution of " + dependencyId + ": "
+                        + mvnwFile.getName() + " not found in the project");
+                return;
+            }
+            invoker.setMavenHome(new File(projectPath));
+            invoker.setMavenExecutable(mvnwFile);
+        }
+
+        File tempDirectory = null;
+        try {
+            tempDirectory = Files.createTempDirectory("mi-dependency-").toFile();
+
+            Properties properties = new Properties();
+            properties.setProperty(Constant.ARTIFACT, String.format("%s:%s:%s:%s", dependency.getGroupId(),
+                    dependency.getArtifact(), dependency.getVersion(), dependency.getType()));
+            properties.setProperty(Constant.OUTPUT_DIRECTORY, tempDirectory.getAbsolutePath());
+
+            StringBuilder mavenOutput = new StringBuilder();
+            InvocationRequest request = new DefaultInvocationRequest();
+            request.setPomFile(pomFile);
+            request.setBaseDirectory(new File(projectPath));
+            request.setGoals(Collections.singletonList(MAVEN_DEPENDENCY_COPY_GOAL));
+            request.setProperties(properties);
+            request.setBatchMode(true);
+            // Equivalent to -U: ignore cached "not found" results, e.g. for an artifact deployed after a failed lookup
+            request.setUpdateSnapshots(true);
+            request.setTimeoutInSeconds(MAVEN_TIMEOUT_SECONDS);
+            request.setOutputHandler(line -> mavenOutput.append(line).append(System.lineSeparator()));
+            request.setErrorHandler(line -> mavenOutput.append(line).append(System.lineSeparator()));
+
+            LOGGER.log(Level.INFO, "Resolving dependency with Maven: " + dependencyId);
+            InvocationResult result = invoker.execute(request);
+            if (result.getExitCode() != 0) {
+                LOGGER.log(Level.WARNING, "Maven failed to resolve dependency " + dependencyId + ". Exit code: "
+                        + result.getExitCode() + System.lineSeparator() + mavenOutput);
+                return;
+            }
+
+            File resolvedFile = new File(tempDirectory,
+                    dependency.getArtifact() + HYPHEN + dependency.getVersion() + DOT + dependency.getType());
+            if (!resolvedFile.isFile()) {
+                LOGGER.log(Level.WARNING, "Maven completed but the resolved file was not found for dependency: "
+                        + dependencyId);
+                return;
+            }
+            Files.move(resolvedFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            LOGGER.log(Level.INFO, "Dependency resolved with Maven: " + targetFile.getName());
+        } catch (MavenInvocationException | IOException e) {
+            LOGGER.log(Level.WARNING, "Error occurred while resolving dependency " + dependencyId
+                    + " with Maven: " + e.getMessage());
+        } finally {
+            if (tempDirectory != null) {
+                try {
+                    Utils.deleteDirectory(tempDirectory.toPath());
+                } catch (IOException e) {
+                    LOGGER.log(Level.FINE, "Failed to delete temporary directory: " + tempDirectory, e);
+                }
+            }
+        }
     }
 
     /**
