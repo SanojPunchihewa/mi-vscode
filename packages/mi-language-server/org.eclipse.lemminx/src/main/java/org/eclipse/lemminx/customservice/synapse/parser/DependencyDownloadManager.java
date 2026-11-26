@@ -14,6 +14,7 @@
 
 package org.eclipse.lemminx.customservice.synapse.parser;
 
+import org.eclipse.lemminx.customservice.synapse.parser.pom.PomPropertyResolver;
 import org.eclipse.lemminx.customservice.synapse.utils.Constant;
 import org.eclipse.lemminx.customservice.synapse.utils.Utils;
 
@@ -50,6 +51,8 @@ public class DependencyDownloadManager {
                 pomDetailsResponse.getDependenciesDetails().getConnectorDependencies();
         List<DependencyDetails> integrationProjectDependencies =
                 pomDetailsResponse.getDependenciesDetails().getIntegrationProjectDependencies();
+        PomPropertyResolver.resolveDependencies(projectPath, connectorDependencies);
+        PomPropertyResolver.resolveDependencies(projectPath, integrationProjectDependencies);
         ConnectorDependencyDownloadResult connectorResult =
                 ConnectorDownloadManager.downloadDependencies(projectPath, connectorDependencies);
         Node isVersionedDeployment = pomDetailsResponse.getBuildDetails().getVersionedDeployment();
@@ -93,6 +96,7 @@ public class DependencyDownloadManager {
         getPomDetails(projectPath, pomDetailsResponse);
         List<DependencyDetails> integrationProjectDependencies =
                 pomDetailsResponse.getDependenciesDetails().getIntegrationProjectDependencies();
+        PomPropertyResolver.resolveDependencies(projectPath, integrationProjectDependencies);
         Node isVersionedDeployment = pomDetailsResponse.getBuildDetails().getVersionedDeployment();
         boolean isVersionedDeploymentEnabled = isVersionedDeployment != null ?
                 Boolean.parseBoolean(isVersionedDeployment.getValue()) : false;
@@ -193,6 +197,7 @@ public class DependencyDownloadManager {
                 pomDetailsResponse.getDependenciesDetails().getConnectorDependencies()
         );
         dependencies.addAll(pomDetailsResponse.getDependenciesDetails().getIntegrationProjectDependencies());
+        PomPropertyResolver.resolveDependencies(projectPath, dependencies);
         List<DependencyDetails> downloadedDependencies = new ArrayList<>();
         List<DependencyDetails> pendingDependencies = new ArrayList<>();
         String projectId = new File(projectPath).getName() + "_" + Utils.getHash(projectPath);
